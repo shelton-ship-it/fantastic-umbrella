@@ -46,16 +46,16 @@ func (j DownloadErrorJSON) ToErr() *DownloadError {
 // taskWire separa o que vai a disco do runtime não serializável.
 // Version (optimistic concurrency) vive na coluna própria da tabela, não no blob.
 type taskWire struct {
-	ID       string           `json:"id"`
-	Source   DownloadSource   `json:"source"`
-	Policy   DownloadPolicy   `json:"policy"`
-	State    State            `json:"state"`
-	Progress ProgressSnapshot `json:"progress"`
-	Error    *DownloadErrorJSON `json:"error,omitempty"`
-	Files    []FileMetadata   `json:"files,omitempty"`
-	CreatedAt int64           `json:"created_at_ms"`
-	UpdatedAt int64           `json:"updated_at_ms"`
-	Priority int              `json:"priority"`
+	ID        string             `json:"id"`
+	Source    DownloadSource     `json:"source"`
+	Policy    DownloadPolicy     `json:"policy"`
+	State     State              `json:"state"`
+	Progress  ProgressSnapshot   `json:"progress"`
+	Error     *DownloadErrorJSON `json:"error,omitempty"`
+	Files     []FileMetadata     `json:"files,omitempty"`
+	CreatedAt int64              `json:"created_at_ms"`
+	UpdatedAt int64              `json:"updated_at_ms"`
+	Priority  int                `json:"priority"`
 }
 
 // MarshalTask serializa uma tarefa para persistência (blob JSON canónico).

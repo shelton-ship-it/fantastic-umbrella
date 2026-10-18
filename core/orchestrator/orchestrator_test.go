@@ -59,15 +59,15 @@ func (m *memStore) Delete(id string) error {
 
 // fakeEngine implementa engine.Engine sem rede nem UI.
 type fakeEngine struct {
-failStart bool
-caps      engine.Capabilities
-lastCtx   context.Context // último ctx recebido em Start (teste de shutdown)
-handles   []*fakeHandle
+	failStart bool
+	caps      engine.Capabilities
+	lastCtx   context.Context // último ctx recebido em Start (teste de shutdown)
+	handles   []*fakeHandle
 }
 
 type fakeHandle struct {
-id     string
-closed bool
+	id     string
+	closed bool
 }
 
 func (h *fakeHandle) TaskID() string                   { return h.id }
@@ -75,28 +75,28 @@ func (h *fakeHandle) Pause(ctx context.Context) error  { return nil }
 func (h *fakeHandle) Resume(ctx context.Context) error { return nil }
 func (h *fakeHandle) Cancel(ctx context.Context) error { h.closed = true; return nil }
 func (h *fakeHandle) Snapshot() domain.ProgressSnapshot {
-return domain.ProgressSnapshot{TaskID: h.id, State: domain.StateRunning}
+	return domain.ProgressSnapshot{TaskID: h.id, State: domain.StateRunning}
 }
 
 func (e *fakeEngine) Name() string { return "fake" }
 func (e *fakeEngine) Capabilities() engine.Capabilities {
-if e.caps != (engine.Capabilities{}) {
-return e.caps
-}
-return engine.Capabilities{SupportsPause: true, SupportsResume: true}
+	if e.caps != (engine.Capabilities{}) {
+		return e.caps
+	}
+	return engine.Capabilities{SupportsPause: true, SupportsResume: true}
 }
 func (e *fakeEngine) CanHandle(src domain.DownloadSource) bool {
-k := src.Kind
-return k == domain.SourceHTTP || k == domain.SourceMagnet
+	k := src.Kind
+	return k == domain.SourceHTTP || k == domain.SourceMagnet
 }
 func (e *fakeEngine) Start(ctx context.Context, req engine.StartRequest) (engine.JobHandle, error) {
-e.lastCtx = ctx
-if e.failStart {
-return nil, fmt.Errorf("boom")
-}
-h := &fakeHandle{id: req.Task.ID}
-e.handles = append(e.handles, h)
-return h, nil
+	e.lastCtx = ctx
+	if e.failStart {
+		return nil, fmt.Errorf("boom")
+	}
+	h := &fakeHandle{id: req.Task.ID}
+	e.handles = append(e.handles, h)
+	return h, nil
 }
 func (e *fakeEngine) Close() error { return nil }
 
