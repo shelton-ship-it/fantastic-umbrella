@@ -1,0 +1,17 @@
+# process.yml — pipeline antigo (HLS / .bin / ChaCha20 / streaming / armazenamento remoto)
+#
+# FASE 0: este ficheiro existia apenas no ramo do utilizador e nao estava presente
+# no working tree local. Foi recriado aqui como STUB DE QUARANTENA, fiel ao seu
+# conteudo conhecido (um print "Goodbye"), sem qualquer funcionalidade de downloads.
+#
+# DECISAO DE ARQUITETURA (documentada): este pipeline NAO faz parte do novo fluxo
+# do Motor Inteligente de Downloads. Sera substituido por `.github/workflows/ci.yml`
+# na Fase 12 (preparacao para producao). Manter temporariamente para auditoria;
+# remover quando o CI novo estiver operacional.
+name: legacy-process
+on: [push]
+jobs:
+  legacy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Goodbye"
