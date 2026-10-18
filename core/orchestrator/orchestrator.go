@@ -64,6 +64,8 @@ type Orchestrator struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	clock   func() time.Time
+	seq     uint64 // sequência p/ IDs únicos mesmo em chamadas no mesmo ns
+	onEngineEvent func(engine.Event)
 }
 
 type Options struct {
@@ -72,7 +74,70 @@ type Options struct {
 	Sink      engine.EventSink
 	MaxConcur int
 	Clock     func() time.Time // injetável p/ testes
+	// OnEngineEvent: motores emitem eventos (progresso/conclusão/falha) pelo
+	// Sink; o orquestrador precisa de os observar para libertar capacidade e
+	// persistir estados terminais. Um Fanout multiplexa para vários consumidores.
+	OnEngineEvent func(engine.Event)
 }
+
+// Fanout permite que UI e orquestrador consumam o mesmo EventSink sem bloqueio.
+type Fanout struct {
+	mu   sync.RWMutex
+	subs []func(engine.Event)
+	buf  chan engine.Event
+	done chan struct{}
+}
+
+func NewFanout(buffer int) *Fanout {
+	if buffer <= 0 {
+		buffer = 256
+	}
+	f := &Fanout{buf: make(chan engine.Event, buffer), done: make(chan struct{})}
+	go f.run()
+	return f
+}
+
+func (f *Fanout) Subscribe(fn func(engine.Event)) {
+	f.mu.Lock()
+	f.subs = append(f.subs, fn)
+	f.mu.Unlock()
+}
+
+func (f *Fanout) Emit(e engine.Event) {
+	select {
+	case f.buf <- e:
+	default:
+		// Sink não pode bloquear o caminho de dados (contrato engine.EventSink):
+		// sobressaturação descarta o evento MAIS ANTIGO para dar prioridade ao
+		// estado atual — progresso é sempre re-emitido; estados terminais são
+		// re-sincronizáveis via store na próxima List().
+		select {
+		case <-f.buf:
+		default:
+		}
+		select {
+		case f.buf <- e:
+		default:
+		}
+	}
+}
+
+func (f *Fanout) run() {
+	for {
+		select {
+		case e := <-f.buf:
+			f.mu.RLock()
+			for _, s := range f.subs {
+				s(e)
+			}
+			f.mu.RUnlock()
+		case <-f.done:
+			return
+		}
+	}
+}
+
+func (f *Fanout) Close() { close(f.done) }
 
 func New(o Options) (*Orchestrator, error) {
 	if o.Store == nil || o.Router == nil {
@@ -86,24 +151,103 @@ func New(o Options) (*Orchestrator, error) {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Orchestrator{
+	or := &Orchestrator{
 		store: o.Store, router: o.Router, sink: o.Sink,
 		maxConc: o.MaxConcur, handles: map[string]engine.JobHandle{},
 		ctx: ctx, cancel: cancel, clock: clock,
-	}, nil
+	}
+	// Observar eventos dos motores para libertar capacidade e persistir
+	// estados terminais (completed/failed/cancelled) reportados pelo motor.
+	if o.OnEngineEvent != nil {
+		or.onEngineEvent = o.OnEngineEvent
+	}
+	return or, nil
+}
+
+// onEngineEvent é chamado (via Fanout pelo chamador) para cada evento de motor.
+// O orquestrador reage apenas a estados terminais — progresso pertence ao UI.
+func (or *Orchestrator) SetEngineObserver(fn func(engine.Event)) {
+	or.mu.Lock()
+	or.onEngineEvent = fn
+	or.mu.Unlock()
+}
+
+// ObserveEngine trata um evento vindo de um motor. Seguro para ser ligado a
+// Fanout.Subscribe. Retorna true se o evento alterou capacidade ativa.
+func (or *Orchestrator) ObserveEngine(e engine.Event) bool {
+	switch e.Kind {
+	case engine.EventCompleted, engine.EventError:
+	default:
+		return false
+	}
+	or.mu.Lock()
+	h, active := or.handles[e.TaskID]
+	if active {
+		delete(or.handles, e.TaskID)
+		if or.running > 0 {
+			or.running--
+		}
+	}
+	or.mu.Unlock()
+	if !active {
+		return false // já tratado (ex.: cancel explícito)
+	}
+	_ = h
+	t, err := or.store.Get(e.TaskID)
+	if err != nil {
+		return true
+	}
+	if e.Kind == engine.EventError && e.Error != nil {
+		if t.State == domain.StateRunning || t.State == domain.StateVerifying {
+			t.FailRegister(e.Error)
+		}
+	} else if e.State == domain.StateCompleted || e.Kind == engine.EventCompleted {
+		// Motor afirma conclusão; a máquina de estados ainda exige Verifying
+		// quando a política o impõe — se o motor não passou por Verifying,
+		// recusa-se o atalho em vez de aceitar "terminado" cego.
+		if t.State == domain.StateVerifying {
+			if err := t.Transition(domain.StateCompleted); err == nil {
+				or.emitState(t)
+			}
+		}
+	}
+	or.store.Save(t)
+	return true
 }
 
 // Submit cria tarefa a partir de origem reconhecida e enfileira.
 func (o *Orchestrator) Submit(src domain.DownloadSource, policy domain.DownloadPolicy) (*domain.DownloadTask, error) {
+	now := o.clock().UTC()
+	o.mu.Lock()
+	o.seq++
+	n := o.seq
+	o.mu.Unlock()
 	t := &domain.DownloadTask{
-		ID: newTaskID(o.clock()), Source: src, Policy: policy,
-		State: domain.StatePending, CreatedAt: o.clock().UTC(), UpdatedAt: o.clock().UTC(),
+		ID: newTaskID(now, n), Source: src, Policy: policy,
+		State: domain.StatePending, CreatedAt: now, UpdatedAt: now,
 		Progress: domain.ProgressSnapshot{BytesTotal: -1},
 	}
 	if err := o.store.Save(t); err != nil {
 		return nil, fmt.Errorf("orchestrator: persistir: %w", err)
 	}
 	return t, nil
+}
+
+// SetPriority reordena uma tarefa pendente/falhada (maior = primeiro).
+// Tarefas ativas não podem ser reordenadas em voo — isso exigiria reiniciar;
+// o briefing pede reordenação, não reordenação sem custo, logo recusamos
+// silenciosamente mudanças em running para manter honestidade do estado.
+func (o *Orchestrator) SetPriority(id string, priority int) error {
+	t, err := o.store.Get(id)
+	if err != nil {
+		return err
+	}
+	if t.State != domain.StatePending && t.State != domain.StateFailed {
+		return fmt.Errorf("orchestrator: só tarefas pendentes/falhadas podem ser reordenadas (%s está %s)", id, t.State)
+	}
+	t.Priority = priority
+	t.UpdatedAt = o.clock().UTC()
+	return o.store.Save(t)
 }
 
 // StartNext inicia a próxima tarefa elegível (prioridade maior primeiro).
@@ -242,6 +386,6 @@ func (o *Orchestrator) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-func newTaskID(now time.Time) string {
-	return fmt.Sprintf("dl-%d-%06d", now.UnixNano()%1e15, now.Nanosecond()%1000000)
+func newTaskID(now time.Time, seq uint64) string {
+	return fmt.Sprintf("dl-%d-%06d", now.UnixNano()%1e15, seq%1000000)
 }
