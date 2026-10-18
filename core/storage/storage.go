@@ -40,7 +40,7 @@ type Store struct {
 
 // Options de abertura.
 type Options struct {
-	Path        string // ficheiro .db ("" => in-memory para testes)
+	Path        string        // ficheiro .db ("" => in-memory para testes)
 	BusyTimeout time.Duration // espera por locks em vez de falhar de imediato
 }
 

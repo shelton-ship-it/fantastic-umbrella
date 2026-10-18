@@ -26,9 +26,9 @@ func mkTask(id string, state domain.State) *domain.DownloadTask {
 			Kind: domain.SourceHTTP, URL: "https://cdn.example.com/a.zip?token=XYZ",
 			DisplayName: "a.zip",
 		},
-		Policy:   domain.DownloadPolicy{RequireIntegrity: domain.IntegritySHA256, MaxSizeBytes: 1 << 30},
-		State:    state,
-		Progress: domain.ProgressSnapshot{BytesDone: 4096, BytesTotal: 8192},
+		Policy:    domain.DownloadPolicy{RequireIntegrity: domain.IntegritySHA256, MaxSizeBytes: 1 << 30},
+		State:     state,
+		Progress:  domain.ProgressSnapshot{BytesDone: 4096, BytesTotal: 8192},
 		CreatedAt: now, UpdatedAt: now,
 	}
 }

@@ -28,21 +28,12 @@ func newSQLiteOrch(t *testing.T, maxConc int) (*Orchestrator, *storage.Store, *c
 	col := &collector{}
 	fan := NewFanout(64)
 	fan.Subscribe(col.Emit)
-	fan.Subscribe(orchObserveHolder{}) // placeholder substituído abaixo
 	orch, err := New(Options{Store: st, Router: router, Sink: fan, MaxConcur: maxConc, Clock: fixedClock()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// desliga placeholder; liga observador real do orquestrador
-	fan2 := fan // mesma instância; re-subscribe limpo não é necessário porque
-	// orchObserveHolder é no-op — o teste chama ObserveEngine diretamente.
-	_ = fan2
 	return orch, st, col
 }
-
-type orchObserveHolder struct{}
-
-func (orchObserveHolder) Emit(engine.Event) {}
 
 func httpSrc(url string) domain.DownloadSource {
 	return domain.DownloadSource{Kind: domain.SourceHTTP, URL: url, DisplayName: "f.bin"}

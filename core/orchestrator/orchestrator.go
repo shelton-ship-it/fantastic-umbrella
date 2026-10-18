@@ -54,17 +54,17 @@ func (r *EngineRouter) For(src domain.DownloadSource) (engine.Engine, error) {
 
 // Orchestrator é o coração da fila: prioridades, concorrência, controlo.
 type Orchestrator struct {
-	mu      sync.Mutex
-	store   Store
-	router  *EngineRouter
-	sink    engine.EventSink
-	handles map[string]engine.JobHandle
-	maxConc int
-	running int
-	ctx     context.Context
-	cancel  context.CancelFunc
-	clock   func() time.Time
-	seq     uint64 // sequência p/ IDs únicos mesmo em chamadas no mesmo ns
+	mu            sync.Mutex
+	store         Store
+	router        *EngineRouter
+	sink          engine.EventSink
+	handles       map[string]engine.JobHandle
+	maxConc       int
+	running       int
+	ctx           context.Context
+	cancel        context.CancelFunc
+	clock         func() time.Time
+	seq           uint64 // sequência p/ IDs únicos mesmo em chamadas no mesmo ns
 	onEngineEvent func(engine.Event)
 }
 
