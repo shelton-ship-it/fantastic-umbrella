@@ -205,9 +205,14 @@ func TestNoRangeServerSafeRestart(t *testing.T) {
 	resumes := map[string]*ResumeState{}
 	var rmu sync.Mutex
 	e := New(Options{
-		ProgressEvery:  5 * time.Millisecond,
-		ResumeProvider: func(id string) (*ResumeState, bool) { rmu.Lock(); defer rmu.Unlock(); rs, ok := resumes[id]; return rs, ok },
-		ResumePersist:  func(rs ResumeState) { rmu.Lock(); defer rmu.Unlock(); cp := rs; resumes[rs.TaskID] = &cp },
+		ProgressEvery: 5 * time.Millisecond,
+		ResumeProvider: func(id string) (*ResumeState, bool) {
+			rmu.Lock()
+			defer rmu.Unlock()
+			rs, ok := resumes[id]
+			return rs, ok
+		},
+		ResumePersist: func(rs ResumeState) { rmu.Lock(); defer rmu.Unlock(); cp := rs; resumes[rs.TaskID] = &cp },
 	})
 	defer e.Close()
 
@@ -366,27 +371,29 @@ func TestLyingContentRangeRejected(t *testing.T) {
 	resumes := map[string]*ResumeState{}
 	var rmu sync.Mutex
 	e := New(Options{
-		ProgressEvery:  5 * time.Millisecond,
-		ResumeProvider: func(id string) (*ResumeState, bool) { rmu.Lock(); defer rmu.Unlock(); rs, ok := resumes[id]; return rs, ok },
-		ResumePersist:  func(rs ResumeState) { rmu.Lock(); defer rmu.Unlock(); cp := rs; resumes[rs.TaskID] = &cp },
+		ProgressEvery: 5 * time.Millisecond,
+		ResumeProvider: func(id string) (*ResumeState, bool) {
+			rmu.Lock()
+			defer rmu.Unlock()
+			rs, ok := resumes[id]
+			return rs, ok
+		},
+		ResumePersist: func(rs ResumeState) { rmu.Lock(); defer rmu.Unlock(); cp := rs; resumes[rs.TaskID] = &cp },
 	})
 	defer e.Close()
 
 	task := mkTask(srv.URL+"/lie.bin", dir)
 	h, _ := e.Start(context.Background(), engine.StartRequest{Task: task, Sink: &recSink{}})
 	j := h.(*job)
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if atomicLoad(&j.bytesDone) > 10*1024 {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	h.Pause(context.Background())
+	// Pausa deterministica apos escrita de pelo menos um chunk.
+	testSetPauseHook(task.ID)
 	<-j.done
 	if atomicLoad(&j.bytesDone) == 0 {
-		t.Skip("rápido demais para pausar")
+		t.Fatal("pausa deveria ocorrer apos escrita de um chunk")
 	}
+	// A nova corrida deve pausar ANTES de qualquer escrita (estado de retoma
+	// valido ja persistido) - assim a resposta mentirosa e exercida na retoma.
+	testSetPauseHook(task.ID)
 	sink2 := &recSink{}
 	h2, err := e.Start(context.Background(), engine.StartRequest{Task: task, Sink: sink2})
 	if err != nil {

@@ -47,13 +47,19 @@ type ResumeState struct {
 
 // Options globais do motor.
 type Options struct {
-	Client         *http.Client    // nil => default com timeouts sensatos
-	UserAgent      string          // identificável, sem dados do utilizador
-	MaxRedirects   int             // limite explícito (não seguir cegamente)
-	ProgressEvery  time.Duration   // cadência mínima de eventos (throttle UI)
-	SegmentTimeout time.Duration   // deadline por leitura parcial (detecta stalls)
+	Client         *http.Client                             // nil => default com timeouts sensatos
+	UserAgent      string                                   // identificável, sem dados do utilizador
+	MaxRedirects   int                                      // limite explícito (não seguir cegamente)
+	ProgressEvery  time.Duration                            // cadência mínima de eventos (throttle UI)
+	SegmentTimeout time.Duration                            // deadline por leitura parcial (detecta stalls)
 	ResumeProvider func(taskID string) (*ResumeState, bool) // carregado p/ Start
 	ResumePersist  func(ResumeState)                        // chamado em pause/fail/exit
+
+	// WriteHook, se definido, é chamado APÓS cada chunk escrito no ficheiro
+	// temporário (offset = bytes já gravados). Uso legítimo: observabilidade
+	// de progresso e testes determinísticos de pausa — NUNCA para alterar
+	// dados. Deve ser rápido e não bloquear o caminho de dados longamente.
+	WriteHook func(taskID string, offset int64)
 }
 
 // Engine HTTP puro-Go (stdlib). Uma instância partilha o client; cada tarefa
@@ -180,12 +186,12 @@ func (e *Engine) Start(ctx context.Context, req engine.StartRequest) (engine.Job
 // ---- job ----
 
 type job struct {
-	id   string
-	task domain.DownloadTask
-	sink engine.EventSink
-	ctx  context.Context
+	id     string
+	task   domain.DownloadTask
+	sink   engine.EventSink
+	ctx    context.Context
 	cancel context.CancelFunc
-	done chan struct{}
+	done   chan struct{}
 
 	mu           sync.Mutex
 	paused       bool
@@ -241,8 +247,13 @@ func (j *job) isCancelled() bool { j.mu.Lock(); defer j.mu.Unlock(); return j.ca
 func (j *job) isPaused() bool    { j.mu.Lock(); defer j.mu.Unlock(); return j.paused }
 func (j *job) cancelJob()        { j.mu.Lock(); j.cancelled = true; j.mu.Unlock(); j.cancel() }
 
-// svTestPauseHook permite a testes pausar deterministicamente entre o pedido
-// preparado e a escrita do primeiro byte (redes loopback são rápidas demais).
+// svTestPauseHook permite pausar deterministicamente uma tarefa JÁ INICIADA
+// (redes loopback são rápidas demais para pausar por tempo). Quando o hook
+// está ativo, a pausa torna-se efetiva em dois pontos:
+//   - antes de qualquer escrita, se houver estado de retoma válido (segunda
+//     corrida de um teste de retoma — pausa imediata e consistente);
+//   - após cada chunk escrito no ficheiro temporário (progresso já gravado
+//     antes de interromper a rede — nunca há perda silenciosa).
 var svTestPauseHook sync.Map // taskID -> bool
 
 func testSetPauseHook(id string)   { svTestPauseHook.Store(id, true) }
@@ -320,8 +331,8 @@ func (e *Engine) run(j *job) error {
 		}
 	}
 
-	// Pausa determinística para testes (ver svTestPauseHook): ocorre entre o
-	// pedido preparado e a receção do primeiro byte.
+	// Verificar pausa ANTES de qualquer escrita: com estado de retoma válido,
+	// a pausa é imediata e o progresso fica consistentemente persistido.
 	if j.pauseBeforeStart() {
 		return nil
 	}
@@ -495,6 +506,9 @@ func (e *Engine) run(j *job) error {
 				return diag.Explain(werr, src.Redacted())
 			}
 			done := atomic.AddInt64(&j.bytesDone, int64(n))
+			if e.opts.WriteHook != nil {
+				e.opts.WriteHook(j.id, done)
+			}
 			if rl != nil {
 				rl.SleepFor(buf[:n])
 			}

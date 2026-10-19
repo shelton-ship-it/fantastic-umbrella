@@ -12,11 +12,11 @@ import (
 type rangeSupport int
 
 const (
-	rangeUnknown rangeSupport = iota
-	rangeSupported             // Accept-Ranges: bytes observado
-	rangeUnsupported           // Accept-Ranges: none observado
-	rangeProbedOK              // GET parcial 206 validado por Content-Range
-	rangeProbedFail            // pedido parcial devolveu 200 inteiro => sem retoma segura
+	rangeUnknown     rangeSupport = iota
+	rangeSupported                // Accept-Ranges: bytes observado
+	rangeUnsupported              // Accept-Ranges: none observado
+	rangeProbedOK                 // GET parcial 206 validado por Content-Range
+	rangeProbedFail               // pedido parcial devolveu 200 inteiro => sem retoma segura
 )
 
 func detectRangeSupport(h http.Header) rangeSupport {
