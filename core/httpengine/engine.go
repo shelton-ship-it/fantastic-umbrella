@@ -220,6 +220,10 @@ func (j *job) Pause(context.Context) error {
 	j.paused = true
 	j.mu.Unlock()
 	j.cancel() // interrompe o corpo; run() trata paused specially e persiste resume
+	// Pausa de teste determinística: se o flag estiver ativo, consumir aqui
+	// (antes do worker chegar a pauseBeforeStart/checkPauseAfterWrite), para
+	// que a segunda corrida pausar ANTES de qualquer escrita.
+	consumePauseFlag(j.id)
 	return nil
 }
 
@@ -250,23 +254,53 @@ func (j *job) cancelJob()        { j.mu.Lock(); j.cancelled = true; j.mu.Unlock(
 // svTestPauseHook permite pausar deterministicamente uma tarefa JÁ INICIADA
 // (redes loopback são rápidas demais para pausar por tempo). Quando o hook
 // está ativo, a pausa torna-se efetiva em dois pontos:
-//   - antes de qualquer escrita, se houver estado de retoma válido (segunda
-//     corrida de um teste de retoma — pausa imediata e consistente);
 //   - após cada chunk escrito no ficheiro temporário (progresso já gravado
-//     antes de interromper a rede — nunca há perda silenciosa).
+//     antes de interromper a rede — nunca há perda silenciosa), via
+//     checkPauseAfterWrite;
+//   - antes de qualquer escrita, se houver estado de retoma válido (segunda
+//     corrida de um teste de retoma — pausa imediata e consistente), via
+//     pauseBeforeStart.
+// O primeiro Load+Delete é feito pelo caminho que chegar primeiro; o outro
+// torna-se no-op. Nenhum dos dois pode ser perdido: pauseBeforeStart deixa
+// o flag intacto quando não existe estado de retoma, para que o caminho
+// pós-escrita o consuma.
 var svTestPauseHook sync.Map // taskID -> bool
 
 func testSetPauseHook(id string)   { svTestPauseHook.Store(id, true) }
 func testClearPauseHook(id string) { svTestPauseHook.Delete(id) }
 
+// consumePauseFlag remove o flag atómico do mapa e devolve true se estava
+// definido. Não bloqueia nem altera o estado da job — quem consome decide.
+func consumePauseFlag(id string) bool {
+	v, ok := svTestPauseHook.LoadAndDelete(id)
+	return ok && v == true
+}
+
+// checkPauseAfterWrite é chamado na goroutine de transferência após cada
+// chunk escrito + fsync parcial. Se o flag de teste estiver ativo, marca a
+// job como pausada e cancela o contexto — o ciclo de leitura termina pela
+// via rerr!=nil com isPaused()==true, persistindo exatamente os bytes que
+// foram escritos (offset == len(payload)).
+func (j *job) checkPauseAfterWrite() {
+	if !consumePauseFlag(j.id) {
+		return
+	}
+	j.mu.Lock()
+	if !j.cancelled {
+		j.paused = true
+	}
+	j.mu.Unlock()
+	j.cancel()
+}
+
 func (j *job) pauseBeforeStart() bool {
-	v, ok := svTestPauseHook.Load(j.id)
-	if !ok || v != true {
+	if !consumePauseFlag(j.id) {
 		return false
 	}
-	svTestPauseHook.Delete(j.id)
 	j.mu.Lock()
-	j.paused = true
+	if !j.cancelled {
+		j.paused = true
+	}
 	j.mu.Unlock()
 	j.persistResume()
 	return true
@@ -509,6 +543,7 @@ func (e *Engine) run(j *job) error {
 			if e.opts.WriteHook != nil {
 				e.opts.WriteHook(j.id, done)
 			}
+			j.checkPauseAfterWrite() // pausa determinística pós-escrita (nunca perde progresso)
 			if rl != nil {
 				rl.SleepFor(buf[:n])
 			}
@@ -526,6 +561,16 @@ func (e *Engine) run(j *job) error {
 			}
 			if total >= 0 && done >= total {
 				break
+			}
+			// Pausa determinística de teste: se o flag estiver ativo, parar
+			// imediatamente após este chunk escrito — progresso preservado,
+			// nunca há perda silenciosa. O ciclo rerr!=nil abaixo não é
+			// alcançado porque já saímos daqui com f.Close() feito.
+			if j.isPaused() {
+				f.Sync()
+				f.Close()
+				j.persistResume()
+				return nil
 			}
 		}
 		if rerr == io.EOF {
