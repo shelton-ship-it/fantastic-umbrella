@@ -1,6 +1,8 @@
 module streamvault/core
 
-go 1.19
+go 1.21
+
+toolchain go1.22.12
 
 require modernc.org/sqlite v1.23.0
 

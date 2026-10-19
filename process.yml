@@ -1,19 +1,20 @@
 # ─────────────────────────────────────────────────────────────────────
 # QUARENTENA — ficheiro LEGADO (StreamVault Process "Leve"), NÃO é um
-# workflow do produto StreamVault Core. Mantido como arquivo do pipeline
-# antigo (aria2c/libtorrent, HLS/.bin, ChaCha20, Worker de ingest),
-# excluído do novo fluxo na Fase 0 da auditoria.
+# workflow do produto StreamVault Core. Mantido como arquivo integral do
+# pipeline antigo (aria2c/libtorrent, HLS/.bin, ChaCha20, Worker de
+# ingest), excluído do novo fluxo na Fase 0 da auditoria.
 #
-# RESOLUÇÃO DO CONFLITO DE MERGE (PR):
-#   Conflito add/add em process.yml: ours = stub vazio | theirs = pipeline
-#   real completo (1789 linhas). Decisão: preservar o corpo integral de
-#   `theirs` + este cabeçalho. NEUTRALIZAÇÃO mínima e documentada: a única
-#   linha alterada no corpo original é a chave de trigger `on:` → removida
-#   por completo. Sem bloco `on:`, o GitHub NUNCA regista nem executa este
-#   ficheiro como workflow ativo (mesmo se movido para .github/workflows/).
-#   Zero execução, zero superfície de atividade visível na conta.
-#   Jobs, steps, scripts e segredos de referência: corpo 100% intacto.
+# RESOLUÇÃO DEFINITIVA DO CONFLITO DE MERGE (PR):
+#   O conflito era add/add: `main` não tem process.yml; a branch do PR
+#   ("Update print statement", commit 1596943) adiciona o pipeline real
+#   com 1789 linhas. Este ficheiro é agora = corpo integral dessa versão
+#   do PR + este cabeçalho. A ÚNICA alteração no corpo original é a
+#   remoção completa do bloco de trigger `on:` (era só workflow_dispatch
+#   manual). Sem bloco `on:`, o GitHub nunca executa nem regista este
+#   ficheiro como workflow ativo. Jobs, steps, scripts e comentários:
+#   100% intactos. Zero superfície de atividade na conta.
 # ─────────────────────────────────────────────────────────────────────
+
 name: StreamVault Process (Leve)
 
 # ═══════════════════════════════════════════════════════════════════════
