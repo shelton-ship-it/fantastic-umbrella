@@ -105,8 +105,20 @@ func TestRangeServerResume(t *testing.T) {
 	dir := t.TempDir()
 	resumes := map[string]*ResumeState{}
 	var rmu sync.Mutex
+	// Pausa DETERMINÍSTICA via WriteHook: pausamos imediatamente após a
+	// primeira escrita confirmada em disco. Redes loopback são rápidas
+	// demais para pausa por tempo; este método garante que a pausa ocorre
+	// com progresso persistido e NUNCA a meio de uma escrita.
+	var once sync.Once
+	pausedCh := make(chan struct{})
 	e := New(Options{
 		ProgressEvery: 10 * time.Millisecond,
+		WriteHook: func(taskID string, offset int64) {
+			once.Do(func() {
+				close(pausedCh)
+				testSetPauseHook(taskID) // pausa efetiva na PRÓXIMA fronteira de escrita segura
+			})
+		},
 		ResumeProvider: func(id string) (*ResumeState, bool) {
 			rmu.Lock()
 			defer rmu.Unlock()
@@ -125,22 +137,16 @@ func TestRangeServerResume(t *testing.T) {
 	task := mkTask(srv.URL+"/f.bin", dir)
 	sink := &recSink{}
 
-	// Start + Pause no meio
+	// Start; a pausa acontece dentro do WriteHook (após chunk escrito).
 	h, err := e.Start(context.Background(), engine.StartRequest{Task: task, Sink: sink})
 	if err != nil {
 		t.Fatal(err)
 	}
 	j := h.(*job)
-	// esperar progresso substancial mas não completo
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if atomicLoad(&j.bytesDone) > 50*1024 {
-			break
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-	if err := h.Pause(context.Background()); err != nil {
-		t.Fatal(err)
+	select {
+	case <-pausedCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("WriteHook nunca disparou — transferência não avançou?")
 	}
 	<-j.done
 	partial := atomicLoad(&j.bytesDone)
