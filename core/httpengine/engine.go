@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,6 +61,12 @@ type Options struct {
 	// de progresso e testes determinísticos de pausa — NUNCA para alterar
 	// dados. Deve ser rápido e não bloquear o caminho de dados longamente.
 	WriteHook func(taskID string, offset int64)
+
+	// StartHook, se definido, é chamado IMEDIATAMENTE após a job ser criada
+	// e registada, ANTES de a goroutine de transferência arrancar. Permite
+	// ao teste obter o handle sem race (loopback é rápido demais para
+	// sincronização por tempo). Em produção fica nil — zero custo.
+	StartHook func(taskID string, h engine.JobHandle)
 }
 
 // Engine HTTP puro-Go (stdlib). Uma instância partilha o client; cada tarefa
@@ -161,7 +168,11 @@ func (e *Engine) Start(ctx context.Context, req engine.StartRequest) (engine.Job
 		done: make(chan struct{}), total: -1,
 	}
 	e.handles[req.Task.ID] = j
+	hook := e.opts.StartHook
 	e.mu.Unlock()
+	if hook != nil {
+		hook(req.Task.ID, j) // handle disponível ao teste antes de qualquer escrita
+	}
 
 	go func() {
 		defer close(j.done)
@@ -169,7 +180,13 @@ func (e *Engine) Start(ctx context.Context, req engine.StartRequest) (engine.Job
 			e.mu.Lock()
 			delete(e.handles, j.id)
 			e.mu.Unlock()
-			j.persistResume() // último snapshot mesmo em falha/conclusão
+			// Persistir retoma APENAS em saída controlada por pausa E com
+			// progresso parcial coerente. Um erro terminal nunca deixa
+			// estado de retoma fantasma (offset/total inconsistentes) que a
+			// corrida seguinte tentaria honrar.
+			if j.isPaused() && !j.isCancelled() {
+				j.resumeGuarded() // último snapshot do progresso preservado
+			}
 		}()
 		j.err = e.run(j)
 		if j.err != nil && !j.isPaused() && !j.isCancelled() {
@@ -220,10 +237,10 @@ func (j *job) Pause(context.Context) error {
 	j.paused = true
 	j.mu.Unlock()
 	j.cancel() // interrompe o corpo; run() trata paused specially e persiste resume
-	// Pausa de teste determinística: se o flag estiver ativo, consumir aqui
-	// (antes do worker chegar a pauseBeforeStart/checkPauseAfterWrite), para
-	// que a segunda corrida pausar ANTES de qualquer escrita.
-	consumePauseFlag(j.id)
+	// NÃO consumir aqui o svTestPauseHook: quem pausa é um observador externo
+	// (testes). O hook só é consumido pelos pontos de escrita da própria job
+	// (pauseBeforeStart / checkPauseAfterWrite), garantindo que a pausa tem
+	// efeito exatamente num ponto com progresso já persistido — nunca perdido.
 	return nil
 }
 
@@ -260,6 +277,7 @@ func (j *job) cancelJob()        { j.mu.Lock(); j.cancelled = true; j.mu.Unlock(
 //   - antes de qualquer escrita, se houver estado de retoma válido (segunda
 //     corrida de um teste de retoma — pausa imediata e consistente), via
 //     pauseBeforeStart.
+//
 // O primeiro Load+Delete é feito pelo caminho que chegar primeiro; o outro
 // torna-se no-op. Nenhum dos dois pode ser perdido: pauseBeforeStart deixa
 // o flag intacto quando não existe estado de retoma, para que o caminho
@@ -306,6 +324,25 @@ func (j *job) pauseBeforeStart() bool {
 	return true
 }
 
+// checkResponseDrift compara ETag/Last-Modified/tamanho da resposta atual com
+// a sessão de retoma ANTES de qualquer escrita. Distingue "o servidor mudou o
+// recurso" de corrupção local: se os identificadores divergirem, a retoma é
+// insegura e é recusada com ErrResumeMismatch (nunca misturar fontes).
+func (j *job) checkResponseDrift(resume *ResumeState, etag, lastMod string, total int64) *domain.DownloadError {
+	if resume == nil || (resume.ETag == "" && resume.Total <= 0) {
+		return nil
+	}
+	old := integrity.RemoteIdentity{ETag: resume.ETag, LastModified: resume.LastModified, SizeBytes: resume.Total}
+	now := integrity.RemoteIdentity{ETag: etag, LastModified: lastMod, SizeBytes: total}
+	if drift := old.Compare(now); drift != "" {
+		return domain.NewError(domain.ErrResumeMismatch, nil,
+			"O recurso remoto mudou desde a última sessão ("+drift+").",
+			"Retoma insegura; reinicie a transferência para garantir consistência.",
+			domain.CertaintyObserved, true)
+	}
+	return nil
+}
+
 func (j *job) emit(kind engine.EventKind, extra map[string]string) {
 	if j.sink == nil {
 		return
@@ -326,9 +363,23 @@ func (j *job) persistResume() {
 	if j.opts_persist == nil {
 		return
 	}
+	done := atomic.LoadInt64(&j.bytesDone)
 	j.opts_persist(ResumeState{TaskID: j.id, TempPath: j.tempPath,
-		BytesDone: atomic.LoadInt64(&j.bytesDone), Total: atomic.LoadInt64(&j.total),
+		BytesDone: done, Total: atomic.LoadInt64(&j.total),
 		ETag: j.etag, LastModified: j.lastMod, CapturedAt: j.capturedAt})
+}
+
+// resumeGuarded persiste retoma APENAS com progresso parcial coerente
+// (0 < done < total). Um erro terminal nunca deve deixar estado de retoma
+// fantasma; uma conclusão completa não precisa de retoma. Chamado nos pontos
+// de pausa controlada e no defer da goroutine run.
+func (j *job) resumeGuarded() {
+	done := atomic.LoadInt64(&j.bytesDone)
+	total := atomic.LoadInt64(&j.total)
+	if done <= 0 || (total >= 0 && done >= total) {
+		return
+	}
+	j.persistResume()
 }
 
 // opts_persist é injetado pelo motor (campo separado para clareza).
@@ -422,42 +473,50 @@ func (e *Engine) run(j *job) error {
 		}
 	}
 
-	// metadados honrados: só reportamos quando REALMENTE disponíveis
+	// metadados honrados: só reportamos quando REALMENTE disponíveis.
+	// Para 206, o total do recurso é preferencialmente o total declarado em
+	// Content-Range ("bytes S-E/T"): é auto-consistente com os bytes que o
+	// servidor vai enviar. O Content-Length + offset serve de fallback e de
+	// cruzamento — se divergirem, a resposta é inconsistente e rejeitada
+	// (nunca escrever com base num total errado).
+	respCR := resp.Header.Get("Content-Range")
 	total := parseContentLength(resp.Header)
-	if resp.StatusCode == http.StatusPartialContent && total >= 0 {
-		total += offset
-	}
-	if cr := resp.Header.Get("Content-Range"); total < 0 && strings.Contains(cr, "/") {
-		if n, cerr := fmt.Sscanf(cr, "bytes */%d", new(int64)); n == 1 {
-			_ = cerr
-		}
-		idx := strings.LastIndexByte(cr, '/')
-		if idx >= 0 {
-			totStr := cr[idx+1:]
-			if totStr != "*" {
-				var t int64
-				if _, e2 := fmt.Sscanf(totStr, "%d", &t); e2 == nil {
-					total = t
+	if resp.StatusCode == http.StatusPartialContent {
+		var crTotal int64 = -1
+		if idx := strings.LastIndexByte(respCR, '/'); idx >= 0 {
+			if totStr := respCR[idx+1:]; totStr != "*" {
+				if t, cerr := strconv.ParseInt(totStr, 10, 64); cerr == nil && t >= 0 {
+					crTotal = t
 				}
 			}
 		}
-	}
-	atomic.StoreInt64(&j.total, total)
-	j.etag = resp.Header.Get("ETag")
-	j.lastMod = resp.Header.Get("Last-Modified")
-	j.capturedAt = time.Now().UTC()
-
-	// verificação de drift remoto contra a sessão anterior
-	if resume != nil && (resume.ETag != "" || resume.Total > 0) {
-		old := integrity.RemoteIdentity{ETag: resume.ETag, LastModified: resume.LastModified, SizeBytes: resume.Total}
-		now := integrity.RemoteIdentity{ETag: j.etag, LastModified: j.lastMod, SizeBytes: total}
-		if drift := old.Compare(now); drift != "" {
+		switch {
+		case total >= 0 && crTotal >= 0 && total+offset != crTotal:
 			return domain.NewError(domain.ErrResumeMismatch, nil,
-				"O recurso remoto mudou desde a última sessão ("+drift+").",
-				"Retoma insegura; reinicie a transferência para garantir consistência.",
-				domain.CertaintyObserved, true)
+				fmt.Sprintf("Resposta parcial inconsistente: Content-Length (%d) + offset (%d) ≠ total do Content-Range (%d).", total, offset, crTotal),
+				"Retoma abortada por segurança; reinício seguro disponível.", domain.CertaintyObserved, true)
+		case crTotal >= 0:
+			total = crTotal
+		case total >= 0:
+			total += offset
 		}
 	}
+
+	respETag := resp.Header.Get("ETag")
+	respLastMod := resp.Header.Get("Last-Modified")
+
+	// DERIVA REMOTA validada ANTES de qualquer escrita ou persistência:
+	// se ETag/tamanho/Last-Modified divergem da sessão de retoma, a pausa
+	// determinística (hook de teste) não pode mascarar a recusa — o erro é
+	// devolvido independentemente do estado de pausa.
+	if driftErr := j.checkResponseDrift(resume, respETag, respLastMod, total); driftErr != nil {
+		return driftErr
+	}
+
+	atomic.StoreInt64(&j.total, total)
+	j.etag = respETag
+	j.lastMod = respLastMod
+	j.capturedAt = time.Now().UTC()
 
 	// política de tamanho máximo
 	if total >= 0 && j.task.Policy.MaxSizeBytes > 0 && total > j.task.Policy.MaxSizeBytes {
